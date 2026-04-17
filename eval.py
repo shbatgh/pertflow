@@ -1,25 +1,21 @@
-# ADD DISTRIBUTIONAL METRICS 
-# ADD  SOMETHING WHERE IT GENERATES X CELLS AND CALCULATES MMD/KL OR SOMETHING LIKE THAT BETWEEN THE TWO DISTRIBUTIONS
 import argparse
 import json
 from pathlib import Path
 
-import numpy as np
-import scanpy as sc
-import torch
-from safetensors.torch import load_file
-from scipy.stats import pearsonr
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from torch.utils.data import DataLoader
-
-from pertflow import PerturbationModel, SCRNADataset, tokenizer
+from pertflow import (
+    build_pool,
+    choose_device,
+    evaluate_model,
+    load_conditioned_adata,
+    load_model,
+    resolve_config_relative_path,
+)
 
 
 def find_latest_checkpoint(run_dir: Path) -> Path:
-    """Pick the most recent `checkpoint-*` subdirectory by step number."""
     candidates = sorted(
         run_dir.glob("checkpoint-*"),
-        key=lambda p: int(p.name.split("-")[-1]),
+        key=lambda path: int(path.name.split("-")[-1]),
     )
     if not candidates:
         raise FileNotFoundError(f"No checkpoint-* directories found in {run_dir}")
@@ -27,104 +23,77 @@ def find_latest_checkpoint(run_dir: Path) -> Path:
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--run-dir",
-        default="pert-model-flow",
-        help="Trainer output_dir containing config.json and checkpoint-*/model.safetensors",
+    parser = argparse.ArgumentParser(
+        description="Evaluate pertflow with OT-matched control-to-perturbed validation batches."
     )
-    ap.add_argument(
-        "--checkpoint",
-        default=None,
-        help="Specific checkpoint dir (e.g. pert-model-9/checkpoint-52). Defaults to latest in --run-dir.",
-    )
-    ap.add_argument("--data", default="test_ood_context.h5ad")
-    ap.add_argument("--batch-size", type=int, default=256)
-    args = ap.parse_args()
+    parser.add_argument("--run-dir", default="pert-model-ot-flow-direct")
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--data", default="train_val.h5ad")
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--max-conditions", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--output-json", type=Path, default=None)
+    args = parser.parse_args()
 
     if args.checkpoint:
-        ckpt_dir = Path(args.checkpoint)
-        # derive run_dir from the checkpoint's parent so config.json matches weights
-        run_dir = ckpt_dir.parent
+        checkpoint_dir = Path(args.checkpoint)
+        run_dir = checkpoint_dir.parent
     else:
         run_dir = Path(args.run_dir)
-        ckpt_dir = find_latest_checkpoint(run_dir)
+        checkpoint_dir = find_latest_checkpoint(run_dir)
+
     config_path = run_dir / "config.json"
+    with open(config_path) as handle:
+        config = json.load(handle)
 
-    print(f"Loading config from {config_path}")
-    print(f"Loading weights from {ckpt_dir / 'model.safetensors'}")
-
-    with open(config_path) as f:
-        cfg = json.load(f)
-
-    device = (
-        torch.accelerator.current_accelerator().type
-        if torch.accelerator.is_available()
-        else "cpu"
-    )
+    device = choose_device()
     print(f"Using {device} device")
+    print(f"Loading config from {config_path}")
+    print(f"Loading weights from {checkpoint_dir / 'model.safetensors'}")
 
-    model = PerturbationModel(
-        cfg["d_model"],
-        cfg["nheads"],
-        cfg["dim_head"],
-        cfg["num_layers"],
-        cfg["nbins"],
-        head_type=cfg.get("head_type", "flow"),
+    pert_cache_path = resolve_config_relative_path(config["pert_cache_path"], config_path)
+    expression, obs, pert_indices, _, pert_embedding_matrix = load_conditioned_adata(
+        Path(args.data),
+        pert_cache_path,
     )
-    state_dict = load_file(str(ckpt_dir / "model.safetensors"))
-    model.load_state_dict(state_dict)
-    model = model.to(device).eval()
+    pool = build_pool(expression, obs, pert_indices)
+    if not pool.condition_keys:
+        raise ValueError("Evaluation data contains no valid celltype-restricted perturbation conditions")
 
-    ad_obj = sc.read_h5ad(args.data)
-    raw = ad_obj.X.toarray()
-    tokens = tokenizer(raw, cfg["nbins"])
-    ds = SCRNADataset(tokens=tokens, targets=raw)
-    dl = DataLoader(ds, batch_size=args.batch_size)
-
-    all_preds = []
-    all_targets = []
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        for batch in dl:
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-            out = model(input_ids=input_ids)
-            all_preds.append(out.logits.float().cpu().numpy())
-            all_targets.append(labels.float().cpu().numpy())
-
-    preds = np.concatenate(all_preds)
-    targets = np.concatenate(all_targets)
-
-    # Global metrics
-    print(f"MSE:  {mean_squared_error(targets, preds):.6f}")
-    print(f"MAE:  {mean_absolute_error(targets, preds):.6f}")
-    print(f"R²:   {r2_score(targets, preds):.6f}")
-
-    # Per-cell correlation (how well each cell's profile is reconstructed)
-    cell_pearson = [pearsonr(targets[i], preds[i])[0] for i in range(len(targets))]
-    print(
-        f"\nPer-cell Pearson r:  {np.nanmean(cell_pearson):.4f} ± {np.nanstd(cell_pearson):.4f}"
+    model = load_model(
+        config=config,
+        checkpoint_path=checkpoint_dir / "model.safetensors",
+        device=device,
+        pert_embedding_matrix=pert_embedding_matrix,
     )
 
-    # Per-gene correlation (how well each gene's variation across cells is captured)
-    gene_pearson = []
-    for g in range(targets.shape[1]):
-        if targets[:, g].std() > 0:
-            gene_pearson.append(pearsonr(targets[:, g], preds[:, g])[0])
-    print(
-        f"Per-gene Pearson r:  {np.nanmean(gene_pearson):.4f} ± {np.nanstd(gene_pearson):.4f}"
-    )
-    print(
-        f"  Genes with r > 0.6: {sum(1 for r in gene_pearson if r > 0.6)}/{len(gene_pearson)}"
+    aggregate_metrics, per_condition = evaluate_model(
+        model=model,
+        pool=pool,
+        device=device,
+        batch_size=args.batch_size,
+        steps=args.steps or config.get("flow_steps", 16),
+        ot_match_space=config.get("ot_match_space", "latent"),
+        ot_solver=config.get("ot_solver", "sinkhorn"),
+        ot_reg=config.get("ot_reg", 0.05),
+        max_conditions=args.max_conditions,
+        seed=args.seed,
     )
 
-    # Fraction of variance unexplained per gene
-    gene_fvu = []
-    for g in range(targets.shape[1]):
-        var = targets[:, g].var()
-        if var > 0:
-            gene_fvu.append(((targets[:, g] - preds[:, g]) ** 2).mean() / var)
-    print(f"Per-gene FVU (median): {np.nanmedian(gene_fvu):.4f}")
+    payload = {
+        "run_dir": str(run_dir),
+        "checkpoint": str(checkpoint_dir),
+        "data": str(args.data),
+        "aggregate": aggregate_metrics,
+        "per_condition": per_condition,
+    }
+
+    print(json.dumps(payload, indent=2))
+    if args.output_json is not None:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.output_json, "w") as handle:
+            json.dump(payload, handle, indent=2)
 
 
 if __name__ == "__main__":
