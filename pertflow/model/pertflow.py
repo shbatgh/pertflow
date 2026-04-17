@@ -490,7 +490,7 @@ def main():
             if args.head_type == "flow"
             else args.head_type
         )
-        output_dir = Path(f"pert-model-ot-{suffix}")
+        output_dir = Path(f"training/pert-model-ot-{suffix}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     expression, obs, pert_indices, gene_to_idx, pert_embedding_matrix = load_conditioned_adata(
